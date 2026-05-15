@@ -17,42 +17,73 @@ MAX_MSG_LEN = 4000
 # Argentina pasa siempre sin importar el nombre de la liga.
 
 LIGAS_PERMITIDAS = [
-    # Europa top 5
+    # Europa top 5 — nombres en inglés Y español (Promiedos usa español)
     ("england",      "premier league"),
+    ("inglaterra",   "premier league"),
     ("spain",        "laliga"),
     ("spain",        "la liga"),
+    ("españa",       "laliga"),
+    ("españa",       "la liga"),
     ("germany",      "bundesliga"),
+    ("alemania",     "bundesliga"),
     ("italy",        "serie a"),
+    ("italia",       "serie a"),
     ("france",       "ligue 1"),
+    ("francia",      "ligue 1"),
+    ("portugal",     "primeira liga"),
+    ("portugal",     "liga portugal"),
+    ("netherlands",  "eredivisie"),
+    ("holanda",      "eredivisie"),
     # Copas UEFA
     ("europa",       "champions league"),
     ("europa",       "europa league"),
     ("europa",       "conference league"),
     ("europe",       "champions league"),
     ("europe",       "europa league"),
+    ("internacional","champions league"),
+    ("internacional","europa league"),
+    ("internacional","conference league"),
     # Copas nacionales top 5
     ("england",      "fa cup"),
+    ("inglaterra",   "fa cup"),
     ("spain",        "copa del rey"),
+    ("españa",       "copa del rey"),
     ("germany",      "dfb pokal"),
+    ("alemania",     "dfb pokal"),
     ("italy",        "coppa italia"),
+    ("italia",       "coppa italia"),
     ("france",       "coupe de france"),
+    ("francia",      "copa de francia"),
     # Sudamérica continental
     ("sudamérica",   "libertadores"),
     ("sudamerica",   "libertadores"),
     ("south america","libertadores"),
+    ("internacional","libertadores"),
     ("sudamérica",   "sudamericana"),
     ("sudamerica",   "sudamericana"),
     ("south america","sudamericana"),
-    # Ligas nacionales sudamérica (solo primera división)
+    ("internacional","sudamericana"),
+    # Ligas nacionales sudamérica
     ("brazil",       "série a"),
+    ("brasil",       "série a"),
+    ("brasil",       "brasileirao"),
     ("mexico",       "liga mx"),
     ("méxico",       "liga mx"),
+    ("uruguay",      "primera división"),
+    ("uruguay",      "primera division"),
+    ("chile",        "primera división"),
+    ("chile",        "primera division"),
+    ("colombia",     "liga betplay"),
+    ("colombia",     "primera a"),
+    ("peru",         "liga 1"),
+    ("perú",         "liga 1"),
     # Torneos de selecciones (pais vacío = cualquier país)
     ("",             "world cup"),
     ("",             "copa america"),
     ("",             "copa américa"),
     ("",             "nations league"),
     ("",             "eliminatorias"),
+    ("",             "mundial"),
 ]
 
 # Palabras que EXCLUYEN una liga aunque coincida con las anteriores
