@@ -1,18 +1,16 @@
 """
 Scraper de partidos de fútbol.
-Fuentes:
-  1. Sofascore (API no oficial, sin clave, cobertura total mundial)
-  2. ESPN API pública (ligas top)
-  3. football-data.org (ligas europeas, con token gratuito)
+Fuente principal: Promiedos.com.ar (API interna Next.js)
+Fallback: ESPN API pública
 """
 
 import asyncio
 import logging
-import os
 import re
 from datetime import date, datetime, timedelta
 from dataclasses import dataclass, field
 from typing import Optional
+import os
 
 import httpx
 import pytz
@@ -20,7 +18,6 @@ import pytz
 logger = logging.getLogger(__name__)
 
 TZ_ARG = pytz.timezone("America/Argentina/Buenos_Aires")
-FOOTBALL_DATA_TOKEN = os.environ.get("FOOTBALL_DATA_TOKEN", "")
 
 HEADERS_BROWSER = {
     "User-Agent": (
@@ -30,7 +27,10 @@ HEADERS_BROWSER = {
     ),
     "Accept": "application/json, text/plain, */*",
     "Accept-Language": "es-AR,es;q=0.9,en;q=0.8",
+    "Referer": "https://www.promiedos.com.ar/",
 }
+
+FOOTBALL_DATA_TOKEN = os.environ.get("FOOTBALL_DATA_TOKEN", "")
 
 ESPN_SLUGS = [
     ("arg.1",                 "Primera División",     "Argentina"),
@@ -44,11 +44,8 @@ ESPN_SLUGS = [
     ("ger.1",                 "Bundesliga",           "Alemania"),
     ("ita.1",                 "Serie A",              "Italia"),
     ("fra.1",                 "Ligue 1",              "Francia"),
-    ("por.1",                 "Primeira Liga",        "Portugal"),
-    ("ned.1",                 "Eredivisie",           "Holanda"),
     ("mex.1",                 "Liga MX",              "México"),
     ("bra.1",                 "Brasileirao",          "Brasil"),
-    ("usa.1",                 "MLS",                  "Estados Unidos"),
 ]
 
 
@@ -70,93 +67,205 @@ class Liga:
     partidos: list = field(default_factory=list)
 
 
+# ── Función principal ─────────────────────────────────────────────────────────
+
 async def obtener_partidos(fecha: Optional[date] = None) -> list:
     if fecha is None:
         fecha = datetime.now(TZ_ARG).date()
 
+    # Promiedos es la fuente principal
+    ligas_promiedos = await _desde_promiedos(fecha)
+
+    if ligas_promiedos:
+        logger.info(f"Usando Promiedos: {sum(len(l.partidos) for l in ligas_promiedos)} partidos")
+        return _ordenar(ligas_promiedos)
+
+    # Fallback: ESPN + football-data.org
+    logger.warning("Promiedos falló, usando fallback ESPN")
     resultados = await asyncio.gather(
         _desde_espn(fecha),
-        _desde_sofascore(fecha),
         _desde_football_data(fecha) if FOOTBALL_DATA_TOKEN else _vacio(),
         return_exceptions=True,
     )
-
-    ligas_espn  = resultados[0] if isinstance(resultados[0], list) else []
-    ligas_sofa  = resultados[1] if isinstance(resultados[1], list) else []
-    ligas_fdata = resultados[2] if isinstance(resultados[2], list) else []
-
-    return _mergear(ligas_espn, ligas_sofa, ligas_fdata)
+    ligas_espn   = resultados[0] if isinstance(resultados[0], list) else []
+    ligas_fdata  = resultados[1] if isinstance(resultados[1], list) else []
+    return _mergear(ligas_espn, ligas_fdata)
 
 
 async def _vacio():
     return []
 
 
-# ── ESPN ──────────────────────────────────────────────────────────────────────
+# ── Promiedos ─────────────────────────────────────────────────────────────────
+
+async def _desde_promiedos(fecha: date) -> list:
+    try:
+        async with httpx.AsyncClient(
+            timeout=15.0, headers=HEADERS_BROWSER, follow_redirects=True
+        ) as client:
+            # 1. Obtener buildId
+            resp = await client.get("https://www.promiedos.com.ar/")
+            if resp.status_code != 200:
+                logger.error(f"Promiedos home: {resp.status_code}")
+                return []
+
+            build_match = re.search(r'"buildId":"([^"]+)"', resp.text)
+            if not build_match:
+                logger.error("Promiedos: no se encontró buildId")
+                return []
+            build_id = build_match.group(1)
+
+            # 2. Si no es hoy, usar endpoint de fecha
+            hoy = datetime.now(TZ_ARG).date()
+            if fecha == hoy:
+                data_url = f"https://www.promiedos.com.ar/_next/data/{build_id}/index.json"
+            else:
+                fecha_str = fecha.strftime("%d-%m-%Y")
+                data_url = f"https://www.promiedos.com.ar/_next/data/{build_id}/fecha/{fecha_str}.json"
+
+            data_resp = await client.get(data_url)
+
+            # Si falla el endpoint de fecha, intentar con el index y filtrar
+            if data_resp.status_code != 200:
+                logger.warning(f"Promiedos fecha URL falló ({data_resp.status_code}), usando index")
+                data_url = f"https://www.promiedos.com.ar/_next/data/{build_id}/index.json"
+                data_resp = await client.get(data_url)
+                if data_resp.status_code != 200:
+                    return []
+
+            data = data_resp.json()
+
+        leagues = data.get("pageProps", {}).get("data", {}).get("leagues", [])
+        logger.info(f"Promiedos: {len(leagues)} ligas encontradas")
+        return _procesar_promiedos(leagues)
+
+    except Exception as e:
+        logger.error(f"Error Promiedos: {e}")
+        return []
+
+
+def _procesar_promiedos(leagues: list) -> list:
+    ligas_dict = {}
+
+    # Estados de Promiedos
+    ESTADOS = {
+        1: "⏰ Por jugar",
+        2: "🔴 En vivo",
+        3: "⏸️ Entretiempo",
+        4: "✅ Finalizado",
+        5: "✅ Finalizado",
+        6: "📅 Postergado",
+        7: "❌ Suspendido",
+    }
+
+    # Palabras para filtrar ligas no deseadas
+    EXCLUIR = {"femenino", "femenina", "(f)", "sub-", "u17", "u20", "reserva"}
+
+    for liga_data in leagues:
+        nombre = liga_data.get("name", "")
+        pais   = liga_data.get("country_name", "")
+
+        # Filtrar ligas no deseadas
+        nombre_lower = nombre.lower()
+        if any(ex in nombre_lower for ex in EXCLUIR):
+            continue
+
+        for game in liga_data.get("games", []):
+            try:
+                teams = game.get("teams", [])
+                if len(teams) < 2:
+                    continue
+
+                local    = teams[0].get("name", "")
+                visitante = teams[1].get("name", "")
+                if not local or not visitante:
+                    continue
+
+                # Hora — viene como "DD-MM-YYYY HH:MM"
+                start_time = game.get("start_time", "")
+                hora = "--:--"
+                if start_time and " " in start_time:
+                    hora = start_time.split(" ")[1][:5]
+
+                # Estado
+                status_enum = game.get("status", {}).get("enum", 1)
+                estado = ESTADOS.get(status_enum, "⏰ Por jugar")
+
+                # Minuto en vivo
+                if status_enum in (2, 3):
+                    minuto = game.get("game_time_to_display", "")
+                    if minuto:
+                        estado = f"🔴 En vivo {minuto}"
+
+                # Resultado
+                score_local    = teams[0].get("score")
+                score_visitante = teams[1].get("score")
+                resultado = ""
+                if score_local is not None and score_visitante is not None:
+                    resultado = f"{score_local}-{score_visitante}"
+
+                key = f"{pais}-{nombre}"
+                if key not in ligas_dict:
+                    ligas_dict[key] = Liga(nombre=nombre, pais=pais)
+
+                ligas_dict[key].partidos.append(Partido(
+                    liga=nombre, pais=pais, hora=hora,
+                    local=local, visitante=visitante,
+                    resultado=resultado, estado=estado,
+                ))
+            except Exception:
+                continue
+
+    return list(ligas_dict.values())
+
+
+# ── ESPN (fallback) ───────────────────────────────────────────────────────────
 
 async def _desde_espn(fecha: date) -> list:
     ligas_dict = {}
-    fechas_utc = [
-        fecha.strftime("%Y%m%d"),
-        (fecha + timedelta(days=1)).strftime("%Y%m%d"),
-    ]
+    fechas_utc = [fecha.strftime("%Y%m%d"), (fecha + timedelta(days=1)).strftime("%Y%m%d")]
 
     async def _fetch_slug(slug: str, liga_nombre: str, pais: str):
         for fecha_str in fechas_utc:
-            url = (
-                f"https://site.api.espn.com/apis/site/v2/sports/soccer"
-                f"/{slug}/scoreboard?dates={fecha_str}&limit=50"
-            )
+            url = f"https://site.api.espn.com/apis/site/v2/sports/soccer/{slug}/scoreboard?dates={fecha_str}&limit=50"
             try:
                 async with httpx.AsyncClient(timeout=12.0, headers=HEADERS_BROWSER, follow_redirects=True) as client:
                     resp = await client.get(url)
                     if resp.status_code != 200:
                         continue
                     data = resp.json()
-
                 for e in data.get("events", []):
                     try:
                         fecha_utc_str = e.get("date", "")
-                        if not fecha_utc_str:
+                        if not fecha_utc_str or _utc_a_fecha_local(fecha_utc_str) != fecha:
                             continue
-                        fecha_local = _utc_a_fecha_local(fecha_utc_str)
-                        if fecha_local != fecha:
-                            logger.info(f"ESPN skip: {e.get('name')} UTC={fecha_utc_str} local={fecha_local} pedida={fecha}")
-                            continue
-
                         comp = (e.get("competitions") or [{}])[0]
                         competidores = comp.get("competitors", [])
                         if len(competidores) < 2:
                             continue
-
                         home = next((c for c in competidores if c.get("homeAway") == "home"), competidores[0])
                         away = next((c for c in competidores if c.get("homeAway") == "away"), competidores[1])
                         home_name = home.get("team", {}).get("displayName", "")
                         away_name = away.get("team", {}).get("displayName", "")
                         if not home_name or not away_name:
                             continue
-
                         status = comp.get("status", {})
                         status_name = status.get("type", {}).get("name", "STATUS_SCHEDULED")
                         h_score = home.get("score", "")
                         a_score = away.get("score", "")
                         resultado = f"{h_score}-{a_score}" if h_score != "" and a_score != "" and status_name != "STATUS_SCHEDULED" else ""
                         estado = {
-                            "STATUS_SCHEDULED":   "⏰ Por jugar",
+                            "STATUS_SCHEDULED": "⏰ Por jugar",
                             "STATUS_IN_PROGRESS": f"🔴 En vivo {status.get('displayClock','')}",
-                            "STATUS_HALFTIME":    "⏸️ Entretiempo",
-                            "STATUS_FINAL":       "✅ Finalizado",
-                            "STATUS_FULL_TIME":   "✅ Finalizado",
-                            "STATUS_POSTPONED":   "📅 Postergado",
-                            "STATUS_CANCELED":    "❌ Cancelado",
+                            "STATUS_HALFTIME": "⏸️ Entretiempo",
+                            "STATUS_FINAL": "✅ Finalizado",
+                            "STATUS_FULL_TIME": "✅ Finalizado",
+                            "STATUS_POSTPONED": "📅 Postergado",
                         }.get(status_name, "⏰ Por jugar")
-
                         if liga_nombre not in ligas_dict:
                             ligas_dict[liga_nombre] = Liga(nombre=liga_nombre, pais=pais)
-
                         key = f"{home_name}-{away_name}"
                         if not any(f"{p.local}-{p.visitante}" == key for p in ligas_dict[liga_nombre].partidos):
-                            logger.info(f"ESPN add: {liga_nombre} - {home_name} vs {away_name} {_utc_a_hora_local(fecha_utc_str)}")
                             ligas_dict[liga_nombre].partidos.append(Partido(
                                 liga=liga_nombre, pais=pais,
                                 hora=_utc_a_hora_local(fecha_utc_str),
@@ -166,80 +275,14 @@ async def _desde_espn(fecha: date) -> list:
                     except Exception:
                         continue
             except Exception as ex:
-                logger.debug(f"ESPN/{slug}/{fecha_str}: {ex}")
+                logger.debug(f"ESPN/{slug}: {ex}")
 
     await asyncio.gather(*[_fetch_slug(s, n, p) for s, n, p in ESPN_SLUGS])
     logger.info(f"ESPN: {sum(len(l.partidos) for l in ligas_dict.values())} partidos")
     return list(ligas_dict.values())
 
 
-# ── Sofascore ─────────────────────────────────────────────────────────────────
-
-async def _desde_sofascore(fecha: date) -> list:
-    fecha_str = fecha.strftime("%Y-%m-%d")
-    url = f"https://api.sofascore.com/api/v1/sport/football/scheduled-events/{fecha_str}"
-    headers = {**HEADERS_BROWSER, "Referer": "https://www.sofascore.com/", "Origin": "https://www.sofascore.com"}
-    try:
-        async with httpx.AsyncClient(timeout=15.0, headers=headers) as client:
-            resp = await client.get(url)
-            if resp.status_code != 200:
-                logger.warning(f"Sofascore: {resp.status_code}")
-                return []
-            events = resp.json().get("events", [])
-        logger.info(f"Sofascore: {len(events)} eventos")
-        return _procesar_sofascore(events, fecha)
-    except Exception as e:
-        logger.error(f"Sofascore error: {e}")
-        return []
-
-
-def _procesar_sofascore(events: list, fecha: Optional[date] = None) -> list:
-    ligas_dict = {}
-    for e in events:
-        try:
-            tournament  = e.get("tournament", {})
-            category    = tournament.get("category", {})
-            liga_nombre = tournament.get("name", "Desconocida")
-            pais        = category.get("name", "")
-            home = e.get("homeTeam", {}).get("name", "")
-            away = e.get("awayTeam", {}).get("name", "")
-            if not home or not away:
-                continue
-            ts = e.get("startTimestamp")
-            if not ts:
-                continue
-            dt_local = datetime.fromtimestamp(ts, tz=pytz.utc).astimezone(TZ_ARG)
-            if fecha is not None and dt_local.date() != fecha:
-                continue
-            hora = dt_local.strftime("%H:%M")
-            h_score = e.get("homeScore", {}).get("current")
-            a_score = e.get("awayScore", {}).get("current")
-            resultado = f"{h_score}-{a_score}" if h_score is not None and a_score is not None else ""
-            status_code = e.get("status", {}).get("code", 0)
-            if status_code == 0:
-                estado = "⏰ Por jugar"
-            elif status_code == 100:
-                estado = "✅ Finalizado"
-            elif status_code in (6, 7):
-                estado = "⏸️ Entretiempo"
-            elif status_code < 100:
-                estado = f"🔴 En vivo {e.get('status', {}).get('description', '')}"
-            else:
-                estado = "⏰ Por jugar"
-            key = f"{pais}-{liga_nombre}"
-            if key not in ligas_dict:
-                ligas_dict[key] = Liga(nombre=liga_nombre, pais=pais)
-            ligas_dict[key].partidos.append(Partido(
-                liga=liga_nombre, pais=pais, hora=hora,
-                local=home, visitante=away,
-                resultado=resultado, estado=estado,
-            ))
-        except Exception:
-            continue
-    return list(ligas_dict.values())
-
-
-# ── football-data.org ─────────────────────────────────────────────────────────
+# ── football-data.org (fallback) ──────────────────────────────────────────────
 
 async def _desde_football_data(fecha: date) -> list:
     fecha_str = fecha.strftime("%Y-%m-%d")
@@ -253,7 +296,7 @@ async def _desde_football_data(fecha: date) -> list:
         logger.info(f"football-data.org: {len(matches)} partidos")
         return _procesar_football_data(matches)
     except Exception as e:
-        logger.error(f"football-data.org error: {e}")
+        logger.error(f"football-data.org: {e}")
         return []
 
 
@@ -280,7 +323,6 @@ def _procesar_football_data(matches: list) -> list:
                 "SCHEDULED": "⏰ Por jugar", "TIMED": "⏰ Por jugar",
                 "IN_PLAY": "🔴 En vivo", "PAUSED": "⏸️ Entretiempo",
                 "FINISHED": "✅ Finalizado", "POSTPONED": "📅 Postergado",
-                "CANCELLED": "❌ Cancelado",
             }.get(status, "⏰ Por jugar")
             liga_key = comp["id"]
             if liga_key not in ligas_dict:
@@ -295,26 +337,30 @@ def _procesar_football_data(matches: list) -> list:
     return list(ligas_dict.values())
 
 
-# ── Merge ─────────────────────────────────────────────────────────────────────
+# ── Merge y ordenamiento ──────────────────────────────────────────────────────
 
-def _mergear(ligas_espn: list, ligas_sofa: list, ligas_fdata: list) -> list:
+def _mergear(ligas_a: list, ligas_b: list) -> list:
     nombres_vistos = set()
     ligas_finales = []
-    for fuente in [ligas_espn, ligas_fdata, ligas_sofa]:
+    for fuente in [ligas_a, ligas_b]:
         for liga in fuente:
             key = _normalizar(liga.nombre)
             if key not in nombres_vistos:
                 nombres_vistos.add(key)
                 ligas_finales.append(liga)
-    for liga in ligas_finales:
+    return _ordenar(ligas_finales)
+
+
+def _ordenar(ligas: list) -> list:
+    for liga in ligas:
         liga.partidos.sort(key=lambda p: p.hora)
-    ligas_finales.sort(key=lambda l: (
+    ligas.sort(key=lambda l: (
         0 if "argentina" in l.pais.lower() else 1,
         l.partidos[0].hora if l.partidos else "99:99",
     ))
-    total = sum(len(l.partidos) for l in ligas_finales)
-    logger.info(f"Total combinado: {total} partidos en {len(ligas_finales)} ligas")
-    return [l for l in ligas_finales if l.partidos]
+    total = sum(len(l.partidos) for l in ligas)
+    logger.info(f"Total: {total} partidos en {len(ligas)} ligas")
+    return [l for l in ligas if l.partidos]
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
