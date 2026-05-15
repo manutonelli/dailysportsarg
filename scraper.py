@@ -73,22 +73,24 @@ async def obtener_partidos(fecha: Optional[date] = None) -> list:
     if fecha is None:
         fecha = datetime.now(TZ_ARG).date()
 
-    # Promiedos es la fuente principal
-    ligas_promiedos = await _desde_promiedos(fecha)
+    hoy = datetime.now(TZ_ARG).date()
 
-    if ligas_promiedos:
-        logger.info(f"Usando Promiedos: {sum(len(l.partidos) for l in ligas_promiedos)} partidos")
-        return _ordenar(ligas_promiedos)
+    if fecha == hoy:
+        # Hoy: Promiedos como fuente principal
+        ligas_promiedos = await _desde_promiedos(fecha)
+        if ligas_promiedos:
+            logger.info(f"Usando Promiedos: {sum(len(l.partidos) for l in ligas_promiedos)} partidos")
+            return _ordenar(ligas_promiedos)
+        logger.warning("Promiedos falló, usando fallback")
 
-    # Fallback: ESPN + football-data.org
-    logger.warning("Promiedos falló, usando fallback ESPN")
+    # Otras fechas (o fallback): ESPN + football-data.org
     resultados = await asyncio.gather(
         _desde_espn(fecha),
         _desde_football_data(fecha) if FOOTBALL_DATA_TOKEN else _vacio(),
         return_exceptions=True,
     )
-    ligas_espn   = resultados[0] if isinstance(resultados[0], list) else []
-    ligas_fdata  = resultados[1] if isinstance(resultados[1], list) else []
+    ligas_espn  = resultados[0] if isinstance(resultados[0], list) else []
+    ligas_fdata = resultados[1] if isinstance(resultados[1], list) else []
     return _mergear(ligas_espn, ligas_fdata)
 
 
